@@ -152,10 +152,6 @@ except ImportError:
 # -- Global functions ----------------------------------------------------------
 # ==============================================================================
 
-
-FRAME_Q = queue.Queue(maxsize=100)
-STOP_EVENT = threading.Event()
-
 def find_weather_presets():
     rgx = re.compile('.+?(?:(?<=[a-z])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])|$)')
     name = lambda x: ' '.join(m.group(0) for m in rgx.finditer(x))
@@ -275,106 +271,65 @@ class World(object):
             self.trailer_h_real = 2 * self.semitrailer.bounding_box.extent.z       # real height  [m]
             self.trailer_real_ratio = (self.semitrailer.bounding_box.extent.z /
                             self.semitrailer.bounding_box.extent.y)         # H / W
-
             self._dt_consts = {
                 "H_real":     self.trailer_h_real,
-                "ratio_min":  0.5 * self.trailer_real_ratio,
-                "ratio_max":  1.5 * self.trailer_real_ratio,
+                "ratio_min":  0.6 * self.trailer_real_ratio,
+                "ratio_max":  1 * self.trailer_real_ratio,
                 "area_min":   2000,        # px^2 – ignore tiny scraps
                 "area_max":   300000,      # px^2 – ignore the sky / huge blobs
                 "dist_max":   15.0,         # m   – camera can’t see the dots any further
             }
-        
-        h_img, w_img = bgr_image.shape[:2]
-        # Convert BGR to HSV
-        hsv = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2HSV)
+        lab = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2LAB)
+        L, a, b = cv2.split(lab)
+        chroma  = np.sqrt((a.astype(np.int16)-128)**2 + (b.astype(np.int16)-128)**2)
 
-        # Define HSV range for white trailer
-        lower_hsv = (0, 0, 140)
-        upper_hsv = (180, 30, 255)
+        chroma_mask = chroma <= 8                            # low chroma  (white/grey)
+        bright_mask = L >= np.percentile(L, 70)              # top 30 % brightest
+        mask        = (chroma_mask & bright_mask).astype(np.uint8) * 255
 
-        # Threshold HSV image to get only trailer color
-        mask = cv2.inRange(hsv, lower_hsv, upper_hsv)
+        # fill biggest blob
+        cts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if cts:
+            mask[:] = 0
+            cv2.drawContours(mask, [max(cts, key=cv2.contourArea)], -1, 255, -1)
 
-        # Morphological cleanup
-        # kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
-        # # mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-        # mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-        self.last_mask = mask.copy()
+        kernel_close = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 15))
+        kernel_open  = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel_close, iterations=2)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  kernel_open,  iterations=1)
+
+        self.last_mask = mask
         # Find contours
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
         best_detection = None
-
         for c in contours:
             area = cv2.contourArea(c)
             if not (self._dt_consts["area_min"] <= area <= self._dt_consts["area_max"]):
                 continue
-
             x, y, w, h = cv2.boundingRect(c)
-
             ratio = h / float(w)
-
             if not (self._dt_consts["ratio_min"] <= ratio <= self._dt_consts["ratio_max"]):
                 continue
-
             dist_m = (self._dt_consts["H_real"] * self.camera_bp.focal_length_px) / h
             if dist_m > self._dt_consts["dist_max"]:
                 continue
-
             error = ratio/self.trailer_real_ratio
             print(f"++++++++++++++++++++++++{error, x, y, w, h, dist_m}")
             print(f"{cv2.contourArea(c), ratio/self.trailer_real_ratio} +++++++++++++++++++++++")   
             if (best_detection is None) or (error < best_detection[0]):
                 best_detection = (error, x, y, w, h, dist_m)
-
         if best_detection is not None:
             _, x, y, w, h, dist_m = best_detection
 
             self.trailer_coordinates = (x, y, w, h)
             self.distance_m = dist_m
             print(f"Distance is {self.distance_m}")
-
         else:
             print("[TRAILER] not found")
             self.last_trailer_bbox   = None
             self.trailer_coordinates = None
             self.distance_m          = None
-
-    def video_writer_worker(self, rear_path, top_path, rear_shape, top_shape, fps=30):
-        """
-        Runs in its own thread; pulls (stream_id, frame) tuples and writes them.
-        """
-        rear_w = cv2.VideoWriter(
-            rear_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, rear_shape
-        )
-        top_w = cv2.VideoWriter(
-            top_path,  cv2.VideoWriter_fourcc(*"mp4v"), fps, top_shape
-        )
-
-        while not (STOP_EVENT.is_set() and FRAME_Q.empty()):
-            try:
-                stream, frame = FRAME_Q.get(timeout=0.1)
-            except queue.Empty:
-                continue
-
-            if stream == "rear":
-                rear_w.write(frame)
-            else:
-                top_w.write(frame)
-
-        rear_w.release()
-        top_w.release()
-    
-    def rear_callback(self, image):
-        bgr = np.frombuffer(image.raw_data, np.uint8).reshape(
-                (image.height, image.width, 4))[:, :, :3]
-        FRAME_Q.put(("rear", bgr))
-
-    def top_callback(self, image):
-        bgr = np.frombuffer(image.raw_data, np.uint8).reshape(
-                (image.height, image.width, 4))[:, :, :3]
-        FRAME_Q.put(("top", bgr))
     
     def process_and_save_image(self, image, output_dir):
         # Save non processed image
@@ -386,385 +341,166 @@ class World(object):
         bgr_image = img_array[:, :, :3].copy()
 
         self.detect_trailer(bgr_image)
-
-        # if self.trailer_coordinates is not None:
-        #     x, y, w, h = self.trailer_coordinates
-        #     # Box
-        #     cv2.rectangle(bgr_image, (x, y), (x + w, y + h),
-        #                   color=(0, 255, 0), thickness=3)
-        #     # Label text
-        #     label = f"Trailer  {self.distance_m:0.1f} m"
-        #     # Choose a slightly offset origin so the text sits just above the box
-        #     text_origin = (x, max(y - 10, 0))
-        #     cv2.putText(bgr_image, label, text_origin,
-        #                 fontFace=cv2.FONT_HERSHEY_SIMPLEX,
-        #                 fontScale=0.8, color=(0, 255, 0), thickness=2,
-        #                 lineType=cv2.LINE_AA)
-
+        if self.trailer_coordinates is not None:
+            x, y, w, h = self.trailer_coordinates
+            # Box
+            cv2.rectangle(bgr_image, (x, y), (x + w, y + h),
+                          color=(0, 255, 0), thickness=3)
+            # Label text
+            label = f"Trailer  {self.distance_m:0.1f} m"
+            # Choose a slightly offset origin so the text sits just above the box
+            text_origin = (x, max(y - 10, 0))
+            cv2.putText(bgr_image, label, text_origin,
+                        fontFace=cv2.FONT_HERSHEY_SIMPLEX,
+                        fontScale=0.8, color=(0, 255, 0), thickness=2,
+                        lineType=cv2.LINE_AA)
         # ---------- 4. Save images ----------
         # 4a: raw frame (already as CARLA Image object)
-        # if self.record_video and self.video_writer:           # write every frame
-        #     self.video_writer.write(bgr_image)
+        if self.record_video and self.video_writer:           # write every frame
+            self.video_writer.write(bgr_image)
         # 4b: labelled frame – only if you just drew something;
         #     you can always save it, but this avoids double files when no detections.
-        # if self.trailer_coordinates is not None:
-        #     # cv2 uses BGR – save directly
-        #     # cv2.imwrite(str(output_dir / f'labelled_{image.frame:06d}.png'),
-        #                 # bgr_image)
-        # else:
-        #     # Optional: still save an unlabelled copy so every frame has a match
-        #     # cv2.imwrite(str(output_dir / f'labelled_{image.frame:06d}.png'),
-        #                 bgr_image)
-        # if hasattr(self, "last_mask") and self.last_mask is not None:
-        #     # cv2.imwrite(str(output_dir / f"mask_{image.frame:06d}.png"), self.last_mask)
+        if self.trailer_coordinates is not None:
+            # cv2 uses BGR – save directly
+            cv2.imwrite(str(output_dir / f'labelled_{image.frame:06d}.png'),
+                        bgr_image)
+        else:
+            # Optional: still save an unlabelled copy so every frame has a match
+            cv2.imwrite(str(output_dir / f'labelled_{image.frame:06d}.png'),
+                        bgr_image)
+        if hasattr(self, "last_mask") and self.last_mask is not None:
+            cv2.imwrite(str(output_dir / f"mask_{image.frame:06d}.png"), self.last_mask)
 
         #     # Also save the masked color image (only detected regions in color)
-        #     masked_image = cv2.bitwise_and(bgr_image, bgr_image, mask=self.last_mask)
-            # cv2.imwrite(str(output_dir / f"masked_{image.frame:06d}.png"), masked_image)
-
-    # def restart(self):
-    #     weather = carla.WeatherParameters.WetCloudyNoon
-    #     self.world.set_weather(weather)
-    #     self.player_max_speed = 1.589
-    #     self.player_max_speed_fast = 3.713
-    #     self.spawn_fixed = carla.Transform(
-    #         carla.Location(x=14.130092, y=69.714005, z=0.600000),
-    #         carla.Rotation(pitch=0.0,   yaw=0.073273,  roll=0.0)
-    #     )
-    #     # Keep same camera config if the camera manager exists.
-    #     cam_index = self.camera_manager.index if self.camera_manager is not None else 0
-    #     cam_pos_index = self.camera_manager.transform_index if self.camera_manager is not None else 0
-    #     # Get a random blueprint.
-    #     blueprint_list = get_actor_blueprints(self.world, self.semitruck, self._actor_generation)
-    #     if not blueprint_list:
-    #         raise ValueError("Couldn't find any blueprints with the specified filters")
-    #     blueprint = random.choice(blueprint_list)
-    #     blueprint.set_attribute('role_name', self.actor_role_name)
-    #     if blueprint.has_attribute('terramechanics'):
-    #         blueprint.set_attribute('terramechanics', 'true')
-    #     if blueprint.has_attribute('color'):
-    #         color = random.choice(blueprint.get_attribute('color').recommended_values)
-    #         blueprint.set_attribute('color', color)
-    #     if blueprint.has_attribute('driver_id'):
-    #         driver_id = random.choice(blueprint.get_attribute('driver_id').recommended_values)
-    #         blueprint.set_attribute('driver_id', driver_id)
-    #     if blueprint.has_attribute('is_invincible'):
-    #         blueprint.set_attribute('is_invincible', 'true')
-    #     # set the max speed
-    #     if blueprint.has_attribute('speed'):
-    #         self.player_max_speed = float(blueprint.get_attribute('speed').recommended_values[1])
-    #         self.player_max_speed_fast = float(blueprint.get_attribute('speed').recommended_values[2])
-
-    #     # Spawn the player.
-    #     if self.player is not None:
-    #         spawn_point = self.player.get_transform()
-    #         spawn_point.location.z += 2.0
-    #         spawn_point.rotation.roll = 0.0
-    #         spawn_point.rotation.pitch = 0.0
-    #         self.destroy()
-    #         self.player = self.world.try_spawn_actor(blueprint, self.spawn_fixed)
-    #         self.show_vehicle_telemetry = False
-    #         self.modify_vehicle_physics(self.player)
-
-    #     while self.player is None:
-    #         if not self.map.get_spawn_points():
-    #             print('There are no spawn points available in your map/town.')
-    #             print('Please add some Vehicle Spawn Point to your UE4 scene.')
-    #             sys.exit(1)
-    #         spawn_points = self.map.get_spawn_points()
-    #         spawn_point = random.choice(spawn_points) if spawn_points else carla.Transform()
-    #         # spawn_point = carla.Transform(carla.Location(x=-41.853989, y=-30.438610, z=0.600071), carla.Rotation(pitch=0.000000, yaw=-89.567680, roll=0.000000))
-    #         self.player = self.world.try_spawn_actor(blueprint, spawn_point)
-    #         if self.player:
-    #             print(f"✅ Spawned player at {spawn_point}")
-    #         self.show_vehicle_telemetry = False
-    #         self.modify_vehicle_physics(self.player)
-
-    #     # Get blueprint library
-    #     blueprint_library = self.world.get_blueprint_library()
-
-    #     #Spawn the trailer behind the truck
-    #     if self.semitrailer is not None:
-    #         spawn_point = self.semitrailer.get_transform()
-    #         spawn_point.location.z += 2.0
-    #         spawn_point.rotation.roll = 0.0
-    #         spawn_point.rotation.pitch = 0.0
-    #         self.semitrailer.destroy()
-    #     rear_transform = self.get_location_behind(spawn_point, 10.0)
-    #     print("Trying to spawn trailer now!")
-    #     # Find the trailer blueprint
-    #     trailer_bp = blueprint_library.find(self.trailer)
-    #     self.semitrailer = self.world.try_spawn_actor(trailer_bp, rear_transform)
-
-    #     # Camera blueprint setup
-    #     self.camera_bp = blueprint_library.find('sensor.camera.rgb')
-    #     self.camera_bp.set_attribute('image_size_x', '1920')
-    #     self.camera_bp.set_attribute('image_size_y', '1208')
-    #     self.camera_bp.set_attribute('fov', '120')  # Wide-angle
-    #     self.camera_bp.set_attribute('sensor_tick', '0.033')  # 30 FPS
-    #     # Extract parameters from camera blueprint to calculate focal length
-    #     image_width = int(self.camera_bp.get_attribute('image_size_x'))
-    #     fov_degrees = float(self.camera_bp.get_attribute('fov'))
-    #     fov_rad = math.radians(fov_degrees)
-    #     # Camera focal length in pixels (needed to estimate distance of known detected object)
-    #     self.camera_bp.focal_length_px = int(image_width / (2 * math.tan(fov_rad / 2)))
-
-    #     # Camera transform: behind the truck, slightly above and tilted downward
-    #     camera_transform = carla.Transform(
-    #         carla.Location(x=-2.5, z=2.0, y=0.0),  # 2.5 meters behind the origin of the truck, 2m high
-    #         carla.Rotation(pitch=0.0, yaw=180.0, roll=0.0)  # looking backwards
-    #     )
-
-    #     # Spawn camera attached to the player (truck)
-    #     self.rear_camera = self.world.spawn_actor(self.camera_bp, camera_transform, attach_to=self.player)
-
-    #     # Create output directory with date-time subfolder
-    #     base_output_dir = pathlib.Path(__file__).resolve().parent.parent.parent / 'output'
-    #     timestamp = datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
-    #     run_output_dir = base_output_dir / timestamp
-    #     run_output_dir.mkdir(parents=True, exist_ok=True)
-    #     print(f"Saving images to: {run_output_dir}")
-    #     if self.record_video and self.video_writer is None:
-    #         fourcc = cv2.VideoWriter_fourcc(*'mp4v')          # .mp4, platform-safe
-    #         out_path = run_output_dir / "rear_camera.mp4"
-    #         self.video_writer = cv2.VideoWriter(
-    #             str(out_path), fourcc,
-    #             30.0,                          # FPS must match sensor_tick (1/0.033 ≈ 30)
-    #             (self.camera_bp.get_attribute('image_size_x').as_int(),
-    #             self.camera_bp.get_attribute('image_size_y').as_int()))
-    #         print(f"🎥  Recording video to {out_path}")
-    #     self.rear_camera.listen(lambda image: self.process_and_save_image(image, run_output_dir))
-
-    #     self.top_camera_bp = blueprint_library.find('sensor.camera.rgb')
-    #     self.top_camera_bp.set_attribute('image_size_x', '1920')
-    #     self.top_camera_bp.set_attribute('image_size_y', '1208')
-    #     self.top_camera_bp.set_attribute('fov', '90')          # narrower FOV; less distortion
-    #     self.top_camera_bp.set_attribute('sensor_tick', '0.033')
-    #     top_cam_tf = carla.Transform(
-    #         carla.Location(x=0.0, y=0.0, z=10.0),
-    #         carla.Rotation(pitch=-90.0, yaw=0.0, roll=0.0)
-    #     )
-
-    #     self.top_camera = self.world.spawn_actor(
-    #         self.top_camera_bp, top_cam_tf, attach_to=self.player
-    #     )
-
-    #     if self.record_video:
-    #         top_out = run_output_dir / "top_camera.mp4"
-    #         self.top_writer = cv2.VideoWriter(
-    #             str(top_out),
-    #             cv2.VideoWriter_fourcc(*'mp4v'),
-    #             30.0,
-    #             (self.top_camera_bp.get_attribute('image_size_x').as_int(),
-    #             self.top_camera_bp.get_attribute('image_size_y').as_int())
-    #         )
-    #         print(f"🎥  Recording top-down video to {top_out}")
-
-    #     def process_top_image(image, out_dir):
-    #         array = np.frombuffer(image.raw_data, dtype=np.uint8)
-    #         bgr   = array.reshape((image.height, image.width, 4))[:, :, :3]
-    #         if self.record_video and self.top_writer:
-    #             self.top_writer.write(bgr)
-
-    #     self.top_camera.listen(
-    #         lambda img, d=run_output_dir: process_top_image(img, d)
-    #     )
-
-    #     # ---------------------------------------------------------------------------
-    #     #  ✨ 6. remember to stop / destroy in .destroy() or when leaving
-    #     # ---------------------------------------------------------------------------
-    #     if hasattr(self, 'top_writer'):
-    #         self.top_writer.release()
-    #     if hasattr(self, 'top_camera'):
-    #         self.top_camera.destroy()
-
-    #     # Set up the sensors.
-    #     self.collision_sensor = CollisionSensor(self.player, self.hud)
-    #     self.lane_invasion_sensor = LaneInvasionSensor(self.player, self.hud)
-    #     self.gnss_sensor = GnssSensor(self.player)
-    #     self.imu_sensor = IMUSensor(self.player)
-    #     self.camera_manager = CameraManager(self.player, self.hud, self._gamma)
-    #     self.camera_manager.transform_index = cam_pos_index
-    #     self.camera_manager.set_sensor(cam_index, notify=False)
-    #     actor_type = get_actor_display_name(self.player)
-    #     self.hud.notification(actor_type)
-
-    #     if self.sync:
-    #         self.world.tick()
-    #     else:
-    #         self.world.wait_for_tick()
+            masked_image = cv2.bitwise_and(bgr_image, bgr_image, mask=self.last_mask)
+            cv2.imwrite(str(output_dir / f"masked_{image.frame:06d}.png"), masked_image)
 
     def restart(self):
-        # ------------------------------------------------------------
-        # 0. World / weather / player spawn (unchanged)
-        # ------------------------------------------------------------
         weather = carla.WeatherParameters.WetCloudyNoon
         self.world.set_weather(weather)
-        self.player_max_speed       = 1.589
-        self.player_max_speed_fast  = 3.713
+        self.player_max_speed = 1.589
+        self.player_max_speed_fast = 3.713
         self.spawn_fixed = carla.Transform(
             carla.Location(x=14.130092, y=69.714005, z=0.600000),
-            carla.Rotation(pitch=0.0, yaw=0.073273, roll=0.0)
+            carla.Rotation(pitch=0.0,   yaw=0.073273,  roll=0.0)
         )
-
-        cam_index     = self.camera_manager.index           if self.camera_manager else 0
-        cam_pos_index = self.camera_manager.transform_index if self.camera_manager else 0
-
-        blueprint_list = get_actor_blueprints(
-            self.world, self.semitruck, self._actor_generation
-        )
+        # Keep same camera config if the camera manager exists.
+        cam_index = self.camera_manager.index if self.camera_manager is not None else 0
+        cam_pos_index = self.camera_manager.transform_index if self.camera_manager is not None else 0
+        # Get a random blueprint.
+        blueprint_list = get_actor_blueprints(self.world, self.semitruck, self._actor_generation)
         if not blueprint_list:
             raise ValueError("Couldn't find any blueprints with the specified filters")
         blueprint = random.choice(blueprint_list)
-        blueprint.set_attribute("role_name", self.actor_role_name)
-        if blueprint.has_attribute("terramechanics"):
-            blueprint.set_attribute("terramechanics", "true")
-        if blueprint.has_attribute("color"):
-            blueprint.set_attribute(
-                "color", random.choice(blueprint.get_attribute("color").recommended_values)
-            )
-        if blueprint.has_attribute("driver_id"):
-            blueprint.set_attribute(
-                "driver_id",
-                random.choice(blueprint.get_attribute("driver_id").recommended_values),
-            )
-        if blueprint.has_attribute("is_invincible"):
-            blueprint.set_attribute("is_invincible", "true")
-        if blueprint.has_attribute("speed"):
-            self.player_max_speed      = float(
-                blueprint.get_attribute("speed").recommended_values[1]
-            )
-            self.player_max_speed_fast = float(
-                blueprint.get_attribute("speed").recommended_values[2]
-            )
+        blueprint.set_attribute('role_name', self.actor_role_name)
+        if blueprint.has_attribute('terramechanics'):
+            blueprint.set_attribute('terramechanics', 'true')
+        if blueprint.has_attribute('color'):
+            color = random.choice(blueprint.get_attribute('color').recommended_values)
+            blueprint.set_attribute('color', color)
+        if blueprint.has_attribute('driver_id'):
+            driver_id = random.choice(blueprint.get_attribute('driver_id').recommended_values)
+            blueprint.set_attribute('driver_id', driver_id)
+        if blueprint.has_attribute('is_invincible'):
+            blueprint.set_attribute('is_invincible', 'true')
+        # set the max speed
+        if blueprint.has_attribute('speed'):
+            self.player_max_speed = float(blueprint.get_attribute('speed').recommended_values[1])
+            self.player_max_speed_fast = float(blueprint.get_attribute('speed').recommended_values[2])
 
-        # -------- respawn / fresh spawn --------
+        # Spawn the player.
         if self.player is not None:
-            spawn_point               = self.player.get_transform()
-            spawn_point.location.z   += 2.0
+            spawn_point = self.player.get_transform()
+            spawn_point.location.z += 2.0
             spawn_point.rotation.roll = 0.0
             spawn_point.rotation.pitch = 0.0
             self.destroy()
-            self.player               = self.world.try_spawn_actor(blueprint, self.spawn_fixed)
+            self.player = self.world.try_spawn_actor(blueprint, self.spawn_fixed)
+            self.show_vehicle_telemetry = False
             self.modify_vehicle_physics(self.player)
+
         while self.player is None:
+            if not self.map.get_spawn_points():
+                print('There are no spawn points available in your map/town.')
+                print('Please add some Vehicle Spawn Point to your UE4 scene.')
+                sys.exit(1)
             spawn_points = self.map.get_spawn_points()
-            spawn_point  = random.choice(spawn_points) if spawn_points else carla.Transform()
-            self.player  = self.world.try_spawn_actor(blueprint, spawn_point)
+            spawn_point = random.choice(spawn_points) if spawn_points else carla.Transform()
+            # spawn_point = carla.Transform(carla.Location(x=-41.853989, y=-30.438610, z=0.600071), carla.Rotation(pitch=0.000000, yaw=-89.567680, roll=0.000000))
+            self.player = self.world.try_spawn_actor(blueprint, spawn_point)
             if self.player:
                 print(f"✅ Spawned player at {spawn_point}")
+            self.show_vehicle_telemetry = False
             self.modify_vehicle_physics(self.player)
 
-        # ------------------------------------------------------------
-        # 1. Spawn / respawn trailer
-        # ------------------------------------------------------------
+        # Get blueprint library
         blueprint_library = self.world.get_blueprint_library()
+
+        #Spawn the trailer behind the truck
         if self.semitrailer is not None:
-            ttf                    = self.semitrailer.get_transform()
-            ttf.location.z        += 2.0
-            ttf.rotation.roll      = 0.0
-            ttf.rotation.pitch     = 0.0
+            spawn_point = self.semitrailer.get_transform()
+            spawn_point.location.z += 2.0
+            spawn_point.rotation.roll = 0.0
+            spawn_point.rotation.pitch = 0.0
             self.semitrailer.destroy()
-        rear_tf          = self.get_location_behind(spawn_point, 10.0)
-        trailer_bp       = blueprint_library.find(self.trailer)
-        self.semitrailer = self.world.try_spawn_actor(trailer_bp, rear_tf)
+        rear_transform = self.get_location_behind(spawn_point, 10.0)
+        print("Trying to spawn trailer now!")
+        # Find the trailer blueprint
+        trailer_bp = blueprint_library.find(self.trailer)
+        self.semitrailer = self.world.try_spawn_actor(trailer_bp, rear_transform)
 
-        # ------------------------------------------------------------
-        # 2. Camera blueprints (rear & top-down)
-        # ------------------------------------------------------------
-        self.camera_bp = blueprint_library.find("sensor.camera.rgb")
-        self.camera_bp.set_attribute("image_size_x", "1920")
-        self.camera_bp.set_attribute("image_size_y", "1208")
-        self.camera_bp.set_attribute("fov", "120")
-        self.camera_bp.set_attribute("sensor_tick", "0.033")
+        # Camera blueprint setup
+        self.camera_bp = blueprint_library.find('sensor.camera.rgb')
+        self.camera_bp.set_attribute('image_size_x', '1920')
+        self.camera_bp.set_attribute('image_size_y', '1208')
+        self.camera_bp.set_attribute('fov', '120')  # Wide-angle
+        self.camera_bp.set_attribute('sensor_tick', '0.033')  # 30 FPS
+        # Extract parameters from camera blueprint to calculate focal length
+        image_width = int(self.camera_bp.get_attribute('image_size_x'))
+        fov_degrees = float(self.camera_bp.get_attribute('fov'))
+        fov_rad = math.radians(fov_degrees)
+        # Camera focal length in pixels (needed to estimate distance of known detected object)
+        self.camera_bp.focal_length_px = int(image_width / (2 * math.tan(fov_rad / 2)))
+        img_w  = int(self.camera_bp.get_attribute('image_size_x'))
+        img_h  = int(self.camera_bp.get_attribute('image_size_y'))
+        f = self.camera_bp.focal_length_px
+        cx, cy = img_w / 2.0, img_h / 2.0
+        self.K = np.array([[f, 0, cx],
+                        [0, f, cy],
+                        [0, 0,  1]], dtype=np.float32)
 
-        self.top_camera_bp = blueprint_library.find("sensor.camera.rgb")
-        self.top_camera_bp.set_attribute("image_size_x", "1920")
-        self.top_camera_bp.set_attribute("image_size_y", "1208")
-        self.top_camera_bp.set_attribute("fov", "120")
-        self.top_camera_bp.set_attribute("sensor_tick", "0.033")
-
-        # store focal length for trailer-distance maths
-        img_w  = int(self.camera_bp.get_attribute("image_size_x"))
-        fovDeg = float(self.camera_bp.get_attribute("fov"))
-        self.camera_bp.focal_length_px = int(img_w / (2 * math.tan(math.radians(fovDeg) / 2)))
-
-        # ------------------------------------------------------------
-        # 3. Spawn cameras and wire callbacks (just enqueue frames)
-        # ------------------------------------------------------------
-        rear_tf = carla.Transform(
-            carla.Location(x=-2.5, y=0.0, z=2.0),
-            carla.Rotation(pitch=0.0, yaw=180.0, roll=0.0)
+        # Camera transform: behind the truck, slightly above and tilted downward
+        camera_transform = carla.Transform(
+            carla.Location(x=-2.5, z=2.0, y=0.0),  # 2.5 meters behind the origin of the truck, 2m high
+            carla.Rotation(pitch=0.0, yaw=180.0, roll=0.0)  # looking backwards
         )
-        self.rear_camera = self.world.spawn_actor(self.camera_bp, rear_tf, attach_to=self.player)
-        self.rear_camera.listen(self.rear_callback)          # defined elsewhere in class
 
-        top_tf = carla.Transform(
-            carla.Location(x=-4.0, y=0.0, z=12.0),
-            carla.Rotation(pitch=-90.0, yaw=0.0, roll=0.0)
-        )
-        self.top_camera  = self.world.spawn_actor(self.top_camera_bp, top_tf, attach_to=self.player)
-        self.top_camera.listen(self.top_callback)            # defined elsewhere in class
+        # Spawn camera attached to the player (truck)
+        self.rear_camera = self.world.spawn_actor(self.camera_bp, camera_transform, attach_to=self.player)
 
-        # ------------------------------------------------------------
-        # 4. Start ONE writer-thread the very first time
-        # ------------------------------------------------------------
-        if self.record_video and self._writer_thread is None:
-            # output directory with timestamp
-            base_out   = pathlib.Path(__file__).resolve().parent.parent.parent / "output"
-            timestamp  = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-            run_outdir = base_out / timestamp
-            run_outdir.mkdir(parents=True, exist_ok=True)
-            print(f"Saving videos to: {run_outdir}")
+        # Create output directory with date-time subfolder
+        base_output_dir = pathlib.Path(__file__).resolve().parent.parent.parent / 'output'
+        timestamp = datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+        run_output_dir = base_output_dir / timestamp
+        run_output_dir.mkdir(parents=True, exist_ok=True)
+        print(f"Saving images to: {run_output_dir}")
+        self.rear_camera.listen(lambda image: self.process_and_save_image(image, run_output_dir))
 
-            rear_path = run_outdir / "rear_camera.mp4"
-            top_path  = run_outdir / "top_camera.mp4"
-            rear_sz   = (1920, 1208)
-            top_sz    = (1920, 1208)
-
-            def writer_worker():
-                rear_w = cv2.VideoWriter(
-                    str(rear_path), cv2.VideoWriter_fourcc(*"mp4v"), 30.0, rear_sz
-                )
-                top_w  = cv2.VideoWriter(
-                    str(top_path),  cv2.VideoWriter_fourcc(*"mp4v"), 30.0, top_sz
-                )
-                print(f"🎥 Recording rear video to   {rear_path}")
-                print(f"🎥 Recording top-down video to {top_path}")
-
-                while not (STOP_EVENT.is_set() and FRAME_Q.empty()):
-                    try:
-                        stream, frame = FRAME_Q.get(timeout=0.1)
-                    except queue.Empty:
-                        continue
-                    if stream == "rear":
-                        rear_w.write(frame)
-                    else:
-                        top_w.write(frame)
-
-                rear_w.release()
-                top_w.release()
-
-            self._writer_thread = threading.Thread(target=writer_worker, daemon=True)
-            self._writer_thread.start()
-
-        # ------------------------------------------------------------
-        # 5. Other sensors, camera-manager, HUD, tick (unchanged)
-        # ------------------------------------------------------------
-        self.collision_sensor  = CollisionSensor(self.player, self.hud)
+    #     # Set up the sensors.
+        self.collision_sensor = CollisionSensor(self.player, self.hud)
         self.lane_invasion_sensor = LaneInvasionSensor(self.player, self.hud)
-        self.gnss_sensor       = GnssSensor(self.player)
-        self.imu_sensor        = IMUSensor(self.player)
-        self.camera_manager    = CameraManager(self.player, self.hud, self._gamma)
+        self.gnss_sensor = GnssSensor(self.player)
+        self.imu_sensor = IMUSensor(self.player)
+        self.camera_manager = CameraManager(self.player, self.hud, self._gamma)
         self.camera_manager.transform_index = cam_pos_index
         self.camera_manager.set_sensor(cam_index, notify=False)
-        self.hud.notification(get_actor_display_name(self.player))
+        actor_type = get_actor_display_name(self.player)
+        self.hud.notification(actor_type)
 
         if self.sync:
             self.world.tick()
         else:
             self.world.wait_for_tick()
-
 
     def next_weather(self, reverse=False):
         self._weather_index += -1 if reverse else 1
@@ -833,10 +569,6 @@ class World(object):
             self.player.destroy()
         if self.semitrailer is not None:
             self.semitrailer.destroy()
-        STOP_EVENT.set()             # tell writer thread to finish
-        if hasattr(self, "_writer_thread"):
-            self._writer_thread.join()
-
 
 # ==============================================================================
 # -- KeyboardControl -----------------------------------------------------------
