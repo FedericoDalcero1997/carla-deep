@@ -5,6 +5,7 @@ Deprecated/PythonClient/dist
 TrafficManager/build
 Util/Build
 Install
+output
 Plugins
 !Unreal/CarlaUE4/Plugins
 Unreal/CarlaUE4/Plugins/Streetmap
