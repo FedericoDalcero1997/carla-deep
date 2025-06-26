@@ -208,8 +208,13 @@ class World(object):
         self.hud = hud
         self.player = None
         self.semitrailer = None
+        self._semitrailer_real_ratio = None
+        self._semitrailer_h_real = None
         self.distance_m = None
         self.trailer_coordinates = None
+        self.trailer_detected = False
+        self.missed_frames = 0
+        self.max_missed_frames = 4
         self.camera_bp = None
         self.video_writer = None
         self.record_video = True
@@ -267,69 +272,73 @@ class World(object):
 
         print("detect_trailer called!")
 
-        if not hasattr(self, "_dt_consts"):
-            self.trailer_h_real = 2 * self.semitrailer.bounding_box.extent.z       # real height  [m]
-            self.trailer_real_ratio = (self.semitrailer.bounding_box.extent.z /
-                            self.semitrailer.bounding_box.extent.y)         # H / W
-            self._dt_consts = {
-                "H_real":     self.trailer_h_real,
-                "ratio_min":  0.6 * self.trailer_real_ratio,
-                "ratio_max":  1 * self.trailer_real_ratio,
-                "area_min":   2000,        # px^2 – ignore tiny scraps
-                "area_max":   300000,      # px^2 – ignore the sky / huge blobs
-                "dist_max":   15.0,         # m   – camera can’t see the dots any further
-            }
-        lab = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2LAB)
-        L, a, b = cv2.split(lab)
-        chroma  = np.sqrt((a.astype(np.int16)-128)**2 + (b.astype(np.int16)-128)**2)
+        # Convert BGR to HSV
+        hsv = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2HSV)
 
-        chroma_mask = chroma <= 8                            # low chroma  (white/grey)
-        bright_mask = L >= np.percentile(L, 70)              # top 30 % brightest
-        mask        = (chroma_mask & bright_mask).astype(np.uint8) * 255
+        # Define HSV range for white trailer
+        lower_hsv = (0, 0, 150)
+        upper_hsv = (180, 60, 255)
 
-        # fill biggest blob
-        cts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if cts:
-            mask[:] = 0
-            cv2.drawContours(mask, [max(cts, key=cv2.contourArea)], -1, 255, -1)
+        # Threshold HSV image to get only trailer color
+        mask = cv2.inRange(hsv, lower_hsv, upper_hsv)
 
-        kernel_close = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 15))
-        kernel_open  = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+        self.last_mask = mask.copy()
 
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel_close, iterations=2)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  kernel_open,  iterations=1)
-
-        self.last_mask = mask
+        # Morphological cleanup
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  kernel)
+        # mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+        
         # Find contours
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
         best_detection = None
-        for c in contours:
-            area = cv2.contourArea(c)
-            if not (self._dt_consts["area_min"] <= area <= self._dt_consts["area_max"]):
+
+        for contour in sorted(contours, key=cv2.contourArea, reverse=True):
+            if cv2.contourArea(contour) < 5000:
                 continue
-            x, y, w, h = cv2.boundingRect(c)
+            if cv2.contourArea(contour) < 20000:
+                dist_m = (self._semitrailer_h_real * self.camera_bp.focal_length_px) / h
+                print(f"Skipping object with ratio {ratio} placed at {dist_m} because area is {cv2.contourArea(contour)}, real ratio is {self._semitrailer_real_ratio}")
+                continue
+            x, y, w, h = cv2.boundingRect(contour)
+
             ratio = h / float(w)
-            if not (self._dt_consts["ratio_min"] <= ratio <= self._dt_consts["ratio_max"]):
+            error = ratio/self._semitrailer_real_ratio
+
+            if not (0.8*self._semitrailer_real_ratio <= ratio <= 1.2*self._semitrailer_real_ratio):
+                dist_m = (self._semitrailer_h_real * self.camera_bp.focal_length_px) / h
+                print(f"Skipping object with ratio {ratio} placed at {dist_m} because error is {error}, real ratio is {self._semitrailer_real_ratio}")
                 continue
-            dist_m = (self._dt_consts["H_real"] * self.camera_bp.focal_length_px) / h
-            if dist_m > self._dt_consts["dist_max"]:
+
+            dist_m = (self._semitrailer_h_real * self.camera_bp.focal_length_px) / h
+            if dist_m > 20:
+                print
                 continue
-            error = ratio/self.trailer_real_ratio
-            print(f"++++++++++++++++++++++++{error, x, y, w, h, dist_m}")
-            print(f"{cv2.contourArea(c), ratio/self.trailer_real_ratio} +++++++++++++++++++++++")   
+
+            print(f"++++++++++++++++++++++++{ratio, x, y, w, h, dist_m}")
+            print(f"{error, ratio/self._semitrailer_real_ratio} +++++++++++++++++++++++")   
             if (best_detection is None) or (error < best_detection[0]):
                 best_detection = (error, x, y, w, h, dist_m)
-        if best_detection is not None:
-            _, x, y, w, h, dist_m = best_detection
 
+        if best_detection:
+            self.missed_frames   = 0
+            self.trailer_detected = True
+            _, x, y, w, h, dist_m = best_detection
             self.trailer_coordinates = (x, y, w, h)
             self.distance_m = dist_m
-            print(f"Distance is {self.distance_m}")
+            print(f"Trailer accepted  at x:{x} y:{y} w:{w} h:{h}  "
+                f"ratio={h/w:.2f}  dist={dist_m:.2f} m")
         else:
-            print("[TRAILER] not found")
-            self.last_trailer_bbox   = None
-            self.trailer_coordinates = None
-            self.distance_m          = None
+            if self.trailer_detected:
+                self.missed_frames += 1
+                if self.missed_frames <= self.max_missed_frames:
+                    print(f"Frame missed ({self.missed_frames}/{self.max_missed_frames}) – keeping last bbox")
+                else:
+                    self.trailer_detected   = False
+                    print("Trailer NOT detected")
+                    self.trailer_coordinates = None
+                    self.distance_m = None 
     
     def process_and_save_image(self, image, output_dir):
         # Save non processed image
@@ -425,7 +434,8 @@ class World(object):
                 print('Please add some Vehicle Spawn Point to your UE4 scene.')
                 sys.exit(1)
             spawn_points = self.map.get_spawn_points()
-            spawn_point = random.choice(spawn_points) if spawn_points else carla.Transform()
+            # spawn_point = random.choice(spawn_points) if spawn_points else carla.Transform()
+            spawn_point = carla.Transform(carla.Location(x=106.002838, y=92.812851, z=0.600000), carla.Rotation(pitch=0.000000, yaw=-89.609253, roll=0.000000))
             # spawn_point = carla.Transform(carla.Location(x=-41.853989, y=-30.438610, z=0.600071), carla.Rotation(pitch=0.000000, yaw=-89.567680, roll=0.000000))
             self.player = self.world.try_spawn_actor(blueprint, spawn_point)
             if self.player:
@@ -448,6 +458,9 @@ class World(object):
         # Find the trailer blueprint
         trailer_bp = blueprint_library.find(self.trailer)
         self.semitrailer = self.world.try_spawn_actor(trailer_bp, rear_transform)
+        self._semitrailer_real_ratio = self.semitrailer.bounding_box.extent.z / self.semitrailer.bounding_box.extent.y
+        self._semitrailer_real_ratio = 1
+        self._semitrailer_h_real = 2 * self.semitrailer.bounding_box.extent.z
 
         # Camera blueprint setup
         self.camera_bp = blueprint_library.find('sensor.camera.rgb')
