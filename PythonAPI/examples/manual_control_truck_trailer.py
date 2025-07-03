@@ -284,6 +284,9 @@ class World(object):
         # Threshold HSV image to get only trailer color
         mask = cv2.inRange(hsv, lower_hsv, upper_hsv)
         cv2.imwrite(str(debug_dir / f"{frame_id:04d}_02_threshold.png"), mask)
+        kernel_small = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel_small)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel_small)
         blurred = cv2.GaussianBlur(mask, (0, 0), 3)  # Blurred version for sharpening
         sharpened = cv2.addWeighted(mask, 1.5, blurred, -0.5, 0)
         cv2.imwrite(str(debug_dir / f"{frame_id:04d}_03_sharpened.png"), sharpened)
@@ -291,10 +294,10 @@ class World(object):
         self.last_mask = mask.copy()
 
         # Morphological cleanup
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (21, 21))
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  kernel)
+        kernel_big = cv2.getStructuringElement(cv2.MORPH_RECT, (21, 21))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  kernel_big)
         cv2.imwrite(str(debug_dir / f"{frame_id:04d}_04_opened.png"), mask)
-        # mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+        # mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel_big)
         
         # Find contours
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -302,6 +305,7 @@ class World(object):
         cv2.drawContours(contour_img, contours, -1, (0, 255, 0), 2)
         cv2.imwrite(str(debug_dir / f"{frame_id:04d}_05_contours.png"), contour_img)
         best_detection = None
+        best_box = None
 
         for contour in sorted(contours, key=cv2.contourArea, reverse=True):
             area = cv2.contourArea(contour)
@@ -358,6 +362,7 @@ class World(object):
 
             if (best_detection is None) or (shape_score < best_detection[0]):
                 best_detection = (shape_score, x, y, bw, bh, dist_m)
+                best_box = box.copy()
 
         if best_detection:
             self.missed_frames = 0
@@ -367,9 +372,10 @@ class World(object):
             self.distance_m = dist_m
             print(f"Trailer accepted  at x:{x} y:{y} w:{w} h:{h}  "
                 f"ratio={h/w:.2f}  dist={dist_m:.2f} m")
-            rect_mask = np.zeros_like(mask)
-            cv2.drawContours(rect_mask, [box], 0, 255, -1)
-            cv2.imwrite(str(debug_dir / f"{frame_id:04d}_06_rectangle.png"), rect_mask)
+            rect_mask = np.zeros_like(self.last_mask)
+            cv2.fillConvexPoly(rect_mask, best_box, 255)
+            clean_mask = cv2.bitwise_and(self.last_mask, rect_mask)
+            cv2.imwrite(str(debug_dir / f"{frame_id:04d}_06_rectangle.png"), clean_mask)
         else:
             if self.trailer_detected:
                 self.missed_frames += 1
@@ -475,6 +481,7 @@ class World(object):
             spawn_point = random.choice(spawn_points) if spawn_points else carla.Transform()
             # spawn_point = carla.Transform(carla.Location(x=106.002838, y=92.812851, z=0.600000), carla.Rotation(pitch=0.000000, yaw=-89.609253, roll=0.000000))
             # spawn_point = carla.Transform(carla.Location(x=-41.853989, y=-30.438610, z=0.600071), carla.Rotation(pitch=0.000000, yaw=-89.567680, roll=0.000000))
+            spawn_point = carla.Transform(carla.Location(x=-45.235935, y=-36.500095, z=0.600000), carla.Rotation(pitch=0.000000, yaw=-89.567680, roll=0.000000))
             self.player = self.world.try_spawn_actor(blueprint, spawn_point)
             if self.player:
                 print(f"✅ Spawned player at {spawn_point}")
