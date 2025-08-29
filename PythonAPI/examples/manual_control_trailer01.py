@@ -14,7 +14,6 @@ Welcome to CARLA manual control.
 
 Use ARROWS or WASD keys for control.
 
-    Y            : trailer attaching
     W            : throttle
     S            : brake
     A/D          : steer left/right
@@ -62,23 +61,10 @@ from __future__ import print_function
 # -- find carla module ---------------------------------------------------------
 # ==============================================================================
 
-import argparse
-import collections
-import time
-import cv2
-import datetime
+
 import glob
-import itertools
-import logging
-import math
 import os
-import pathlib
-import queue
-import random
-import re
 import sys
-import threading
-import weakref
 
 try:
     sys.path.append(glob.glob('../carla/dist/carla-*%d.%d-%s.egg' % (
@@ -97,7 +83,15 @@ except IndexError:
 import carla
 
 from carla import ColorConverter as cc
-from collections import deque
+
+import argparse
+import collections
+import datetime
+import logging
+import math
+import random
+import re
+import weakref
 
 try:
     import pygame
@@ -122,7 +116,6 @@ try:
     from pygame.locals import K_b
     from pygame.locals import K_c
     from pygame.locals import K_d
-    from pygame.locals import K_f
     from pygame.locals import K_g
     from pygame.locals import K_h
     from pygame.locals import K_i
@@ -138,7 +131,6 @@ try:
     from pygame.locals import K_v
     from pygame.locals import K_w
     from pygame.locals import K_x
-    from pygame.locals import K_y
     from pygame.locals import K_z
     from pygame.locals import K_MINUS
     from pygame.locals import K_EQUALS
@@ -154,6 +146,7 @@ except ImportError:
 # ==============================================================================
 # -- Global functions ----------------------------------------------------------
 # ==============================================================================
+
 
 def find_weather_presets():
     rgx = re.compile('.+?(?:(?<=[a-z])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])|$)')
@@ -180,7 +173,7 @@ def get_actor_blueprints(world, filter, generation):
     try:
         int_generation = int(generation)
         # Check if generation is in available generations
-        if int_generation in [1, 2, 3]:
+        if int_generation in [1, 2]:
             bps = [x for x in bps if int(x.get_attribute('generation')) == int_generation]
             return bps
         else:
@@ -210,17 +203,7 @@ class World(object):
             sys.exit(1)
         self.hud = hud
         self.player = None
-        self.semitrailer = None
-        self._semitrailer_real_ratio = None
-        self._semitrailer_h_real = None
-        self.distance_m = None
-        self.trailer_coordinates = None
-        self.trailer_detected = False
-        self.missed_frames = 0
-        self.max_missed_frames = 4
-        self.camera_bp = None
-        self.video_writer = None
-        self.record_video = True
+        self.playerTrailer = None
         self.collision_sensor = None
         self.lane_invasion_sensor = None
         self.gnss_sensor = None
@@ -229,11 +212,9 @@ class World(object):
         self.camera_manager = None
         self._weather_presets = find_weather_presets()
         self._weather_index = 0
-        self.semitruck = 'dafxf'
-        self.trailer = 'vehicle.trailer.trailer'
+        self._actor_filter = args.filter
         self._actor_generation = args.generation
         self._gamma = args.gamma
-        self._writer_thread = None
         self.restart()
         self.world.on_tick(hud.on_world_tick)
         self.recording_enabled = False
@@ -256,163 +237,15 @@ class World(object):
             carla.MapLayer.All
         ]
 
-    def get_location_behind(self, transform, distance=10.0):
-        yaw_rad = math.radians(transform.rotation.yaw)
-        offset_x = -distance * math.cos(yaw_rad)
-        offset_y = -distance * math.sin(yaw_rad)
-        new_location = carla.Location(
-            x=transform.location.x + offset_x,
-            y=transform.location.y + offset_y,
-            z=transform.location.z
-        )
-        return carla.Transform(new_location, transform.rotation)
-    
-    def move_drone_camera(self,
-        height_top=10.0,            # m above roofs
-        height_low=1.0,            # m above ground
-        circle_radius=10.0,        # orbit radius
-        transl_speed=0.05,         # m · s⁻¹  (VERY slow)
-        circle_angular=0.05,        # rad · s⁻¹ (≈31 s per lap)
-        pos_smooth=0.15,           # 0‑1  (smaller = softer)
-        rot_smooth=0.10):          # 0‑1  (smaller = softer)
-
-        def _len(v):            # length of a Location used as vector
-            return math.sqrt(v.x*v.x + v.y*v.y + v.z*v.z)
-        
-        def _lerp(a, b, alpha):
-            return a + (b - a) * alpha
-
-        def _lerp_rot(a, b, alpha):
-            # minimal‑arc slerp for yaw/pitch (roll stays 0)
-            dy = ((b.yaw - a.yaw + 180) % 360) - 180
-            dp = ((b.pitch - a.pitch + 180) % 360) - 180
-            return carla.Rotation(yaw=a.yaw + dy*alpha,
-                                pitch=a.pitch + dp*alpha,
-                                roll=0.0)
-
-        def _centre():
-            pts = [self.player.get_transform().location] if self.player else []
-            if self.semitrailer:
-                pts.append(self.semitrailer.get_transform().location)
-            if pts:
-                cx = sum(p.x for p in pts)/len(pts)
-                cy = sum(p.y for p in pts)/len(pts)
-                cz = sum(p.z for p in pts)/len(pts)
-                return carla.Location(cx, cy, cz)
-            return carla.Location()
-
-        def _roof_of(actor, extra=0.0):
-            bb = actor.bounding_box
-            return actor.get_transform().location + carla.Location(z=bb.extent.z + extra)
-
-        keyframes = deque([
-            ("trailer_top",    lambda: _roof_of(self.semitrailer, height_top)),
-            ("circle_trailer", None),                # orbit around trailer
-            ("truck_top",      lambda: _roof_of(self.player,      height_top)),
-            ("circle_truck",   None)                 # orbit around truck
-        ])
-
-        # ─── initialise (exactly above truck, looking down) ────────────────────
-        cam     = self.rear_camera
-        centre  = _centre()
-        here    = keyframes[0][1]()                   # first target == truck_top
-        cam.set_transform(carla.Transform(
-            here,
-            carla.Rotation(pitch=-90.0, yaw=0.0, roll=0.0)))
-
-        # we keep previous pose for smoothing
-        prev_loc = here
-        prev_rot = carla.Rotation(pitch=-90.0, yaw=0.0, roll=0.0)
-
-        # ─── per‑tick update bound to CARLA clock ──────────────────────────────
-        def _on_tick(snapshot):
-            nonlocal prev_loc, prev_rot
-
-            dt = snapshot.timestamp.delta_seconds or 0.05
-
-            phase, _ = keyframes[0]
-
-            # ── advance phase when arrived (for the “top” key‑frames) ─────────
-            if phase.endswith("_top"):
-                arrived = _len(prev_loc - keyframes[0][1]()) < transl_speed * dt * 1.2
-                if arrived:
-                    keyframes.rotate(-1)
-                    phase, _ = keyframes[0]
-
-            # ── choose the actor, its centre, and the orbit centre ────────────
-            if phase.startswith("trailer"):
-                actor      = self.semitrailer
-                centre_loc = actor.get_transform().location
-            else:                                   # truck phases
-                actor      = self.player
-                centre_loc = actor.get_transform().location
-
-            roof_z = actor.bounding_box.extent.z
-
-            # ── target position for this tick ──────────────────────────────────
-            if phase.endswith("_top"):
-                tgt_loc = centre_loc + carla.Location(z=roof_z + height_top)
-            else:   # circle phase
-                theta = snapshot.elapsed_seconds * circle_angular
-                tgt_loc = carla.Location(
-                    x=centre_loc.x + circle_radius * math.cos(theta),
-                    y=centre_loc.y + circle_radius * math.sin(theta),
-                    z=centre_loc.z + roof_z)        # eye‑level orbit
-
-            # ── exact look‑at point (centre of actor) ─────────────────────────
-            look_loc = centre_loc + carla.Location(z=roof_z * 0.5)
-
-            # ── smooth translation ────────────────────────────────────────────
-            alpha_pos = 1 - math.exp(-pos_smooth * dt)
-            new_loc   = _lerp(prev_loc, tgt_loc, alpha_pos)
-
-            # ── smooth rotation toward actor ──────────────────────────────────
-            vec = look_loc - new_loc
-            desired_rot = carla.Rotation(
-                pitch = math.degrees(math.atan2(-vec.z,
-                                math.hypot(vec.x, vec.y))),
-                yaw   = math.degrees(math.atan2(vec.y, vec.x)),
-                roll  = 0.0)
-            alpha_rot = 1 - math.exp(-rot_smooth * dt)
-            new_rot   = _lerp_rot(prev_rot, desired_rot, alpha_rot)
-            new_rot.pitch = max(min(new_rot.pitch, 0.0), -89.0)   # never tilt up
-
-            self.rear_camera.set_transform(carla.Transform(new_loc, new_rot))
-            prev_loc, prev_rot = new_loc, new_rot
-
-        # hook into CARLA’s tick stream (no separate thread needed)
-        self.world.on_tick(_on_tick)
-    
-    def process_and_save_image(self, image, output_dir):
-        # Save non processed image
-        # image.save_to_disk(str(output_dir / f'camera_{image.frame:06d}.png'))
-
-        # Convert raw buffer to BGR image
-        img_array = np.frombuffer(image.raw_data, dtype=np.uint8)
-        img_array = img_array.reshape((image.height, image.width, 4))
-        bgr_image = img_array[:, :, :3].copy()
-        self.video_writer.write(bgr_image)
-
     def restart(self):
-        weather = carla.WeatherParameters.WetCloudyNoon
-        self.world.set_weather(weather)
         self.player_max_speed = 1.589
         self.player_max_speed_fast = 3.713
-        self.spawn_fixed = carla.Transform(
-            carla.Location(x=14.130092, y=69.714005, z=0.600000),
-            carla.Rotation(pitch=0.0,   yaw=0.073273,  roll=0.0)
-        )
         # Keep same camera config if the camera manager exists.
         cam_index = self.camera_manager.index if self.camera_manager is not None else 0
         cam_pos_index = self.camera_manager.transform_index if self.camera_manager is not None else 0
         # Get a random blueprint.
-        blueprint_list = get_actor_blueprints(self.world, self.semitruck, self._actor_generation)
-        if not blueprint_list:
-            raise ValueError("Couldn't find any blueprints with the specified filters")
-        blueprint = random.choice(blueprint_list)
+        blueprint = random.choice(get_actor_blueprints(self.world, "DAFxf", self._actor_generation))
         blueprint.set_attribute('role_name', self.actor_role_name)
-        if blueprint.has_attribute('terramechanics'):
-            blueprint.set_attribute('terramechanics', 'true')
         if blueprint.has_attribute('color'):
             color = random.choice(blueprint.get_attribute('color').recommended_values)
             blueprint.set_attribute('color', color)
@@ -425,100 +258,58 @@ class World(object):
         if blueprint.has_attribute('speed'):
             self.player_max_speed = float(blueprint.get_attribute('speed').recommended_values[1])
             self.player_max_speed_fast = float(blueprint.get_attribute('speed').recommended_values[2])
-
+        # get trailer blueprint
+        blueprintTrailer = random.choice(get_actor_blueprints(self.world, "Trailer_01", self._actor_generation))
+        blueprintTrailer.set_attribute('role_name', 'hero-trailer')
         # Spawn the player.
         if self.player is not None:
             spawn_point = self.player.get_transform()
-            spawn_point.location.z += 2.0
+            spawn_point.location.x = -11436.130859
+            spawn_actor_point.location.y = 6389.307617
+            spawn_point.location.z = 12.0
             spawn_point.rotation.roll = 0.0
             spawn_point.rotation.pitch = 0.0
+            spawn_point.rotation.yaw= 90.0
             self.destroy()
-            self.player = self.world.try_spawn_actor(blueprint, self.spawn_fixed)
+            self.player = self.world.try_spawn_actor(blueprint, spawn_point)
             self.show_vehicle_telemetry = False
             self.modify_vehicle_physics(self.player)
-
+        
         while self.player is None:
             if not self.map.get_spawn_points():
                 print('There are no spawn points available in your map/town.')
                 print('Please add some Vehicle Spawn Point to your UE4 scene.')
-                sys.exit(1)
-            spawn_points = self.map.get_spawn_points()
-            spawn_point = random.choice(spawn_points) if spawn_points else carla.Transform()
-            # spawn_point = carla.Transform(carla.Location(x=106.002838, y=92.812851, z=0.600000), carla.Rotation(pitch=0.000000, yaw=-89.609253, roll=0.000000))
-            # spawn_point = carla.Transform(carla.Location(x=-41.853989, y=-30.438610, z=0.600071), carla.Rotation(pitch=0.000000, yaw=-89.567680, roll=0.000000))
-            spawn_point = carla.Transform(carla.Location(x=-45.235935, y=-36.500095, z=0.600000), carla.Rotation(pitch=0.000000, yaw=-89.567680, roll=0.000000))
-            self.player = self.world.try_spawn_actor(blueprint, spawn_point)
-            if self.player:
-                print(f"✅ Spawned player at {spawn_point}")
+                sys.exit(1)      
+           # spawn_points = self.map.get_spawn_points()
+           # spawn_point = random.choice(spawn_points) if spawn_points else carla.Transform()
+           # forwardVector = spawn_point.get_forward_vector()*0.6
+           # spawn_point.location.x = -11436.130859
+           # spawn_point.location.y = 6395.307617
+           # spawn_point.location.z = 12.0
+           # spawn_point.rotation.roll = 0.0
+           # spawn_point.rotation.pitch = 0.0
+           # spawn_point.rotation.yaw = 0.0
+            
+            spawn_point = carla.Transform(carla.Location(-114.30, 71.84, 1),carla.Rotation(0,90,0)) 
+            self.playerTrailer = self.world.try_spawn_actor(blueprintTrailer, spawn_point)
+            
+        
+         
+            
+            forwardVector = spawn_point.get_forward_vector() * 5.2
+            spawn_point.location += forwardVector
+            #spawn_point.location.y += forwardVector.y
+            #spawn_point.location.z = 12.0
+            #spawn_point.rotation.roll = 0.0
+            #spawn_point.rotation.pitch = 0.0
+            #spawn_point.rotation.yaw = 0.0
+            self.player = self.world.try_spawn_actor(blueprint, spawn_point) 
             self.show_vehicle_telemetry = False
             self.modify_vehicle_physics(self.player)
-
-        # Get blueprint library
-        blueprint_library = self.world.get_blueprint_library()
-
-        #Spawn the trailer behind the truck
-        if self.semitrailer is not None:
-            spawn_point = self.semitrailer.get_transform()
-            spawn_point.location.z += 2.0
-            spawn_point.rotation.roll = 0.0
-            spawn_point.rotation.pitch = 0.0
-            self.semitrailer.destroy()
-        rear_transform = self.get_location_behind(spawn_point, 30.0)
-        print("Trying to spawn trailer now!")
-        # Find the trailer blueprint
-        trailer_bp = blueprint_library.find(self.trailer)
-        self.semitrailer = self.world.try_spawn_actor(trailer_bp, rear_transform)
-        self._semitrailer_real_ratio = self.semitrailer.bounding_box.extent.z / self.semitrailer.bounding_box.extent.y
-        self._semitrailer_real_ratio = 1
-        self._semitrailer_h_real = 2 * self.semitrailer.bounding_box.extent.z
-
-        # Camera blueprint setup
-        self.camera_bp = blueprint_library.find('sensor.camera.rgb')
-        self.camera_bp.set_attribute('image_size_x', '1920')
-        self.camera_bp.set_attribute('image_size_y', '1208')
-        self.camera_bp.set_attribute('fov', '120')  # Wide-angle
-        self.camera_bp.set_attribute('sensor_tick', '0.033')  # 30 FPS
-        # Extract parameters from camera blueprint to calculate focal length
-        image_width = int(self.camera_bp.get_attribute('image_size_x'))
-        fov_degrees = float(self.camera_bp.get_attribute('fov'))
-        fov_rad = math.radians(fov_degrees)
-        # Camera focal length in pixels (needed to estimate distance of known detected object)
-        self.camera_bp.focal_length_px = int(image_width / (2 * math.tan(fov_rad / 2)))
-        img_w  = int(self.camera_bp.get_attribute('image_size_x'))
-        img_h  = int(self.camera_bp.get_attribute('image_size_y'))
-        f = self.camera_bp.focal_length_px
-        cx, cy = img_w / 2.0, img_h / 2.0
-        self.K = np.array([[f, 0, cx],
-                        [0, f, cy],
-                        [0, 0,  1]], dtype=np.float32)
-
-        # Camera transform: behind the truck, slightly above and tilted downward
-        roof_h  = self.semitrailer.bounding_box.extent.z
-        start_h = 5.0
-        tr_loc  = self.semitrailer.get_transform().location
-        cam_loc = carla.Location(x=tr_loc.x, y=tr_loc.y, z=tr_loc.z + roof_h + start_h)
-        cam_rot = carla.Rotation(pitch=-90.0, yaw=0.0, roll=0.0)
-        camera_transform = carla.Transform(cam_loc, cam_rot)
-
-        # Spawn camera
-        self.rear_camera = self.world.spawn_actor(self.camera_bp, camera_transform)
-
-        # Create output directory with date-time subfolder
-        base_output_dir = pathlib.Path(__file__).resolve().parent.parent.parent / 'output'
-        timestamp = datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
-        run_output_dir = base_output_dir / timestamp
-        run_output_dir.mkdir(parents=True, exist_ok=True)
-        self.video_path = str(run_output_dir / 'drone_view.avi')
-        self.video_writer = cv2.VideoWriter(
-            self.video_path,
-            cv2.VideoWriter_fourcc(*'mp4v'),
-            30.0,  # FPS
-            (1920, 1208)  # Frame size: must match camera resolution
-        )
-        print(f"Saving images to: {run_output_dir}")
-        self.rear_camera.listen(lambda image: self.process_and_save_image(image, run_output_dir))
-
-    #     # Set up the sensors.
+         
+           # self.show_vehicle_telemetry = False
+           # self.modify_vehicle_physics(self.player)
+        # Set up the sensors.
         self.collision_sensor = CollisionSensor(self.player, self.hud)
         self.lane_invasion_sensor = LaneInvasionSensor(self.player, self.hud)
         self.gnss_sensor = GnssSensor(self.player)
@@ -528,13 +319,12 @@ class World(object):
         self.camera_manager.set_sensor(cam_index, notify=False)
         actor_type = get_actor_display_name(self.player)
         self.hud.notification(actor_type)
+        
 
         if self.sync:
             self.world.tick()
         else:
             self.world.wait_for_tick()
-        
-        threading.Thread(target=self.move_drone_camera, daemon=True).start()
 
     def next_weather(self, reverse=False):
         self._weather_index += -1 if reverse else 1
@@ -566,6 +356,9 @@ class World(object):
             self.radar_sensor = None
 
     def modify_vehicle_physics(self, actor):
+        # Disabled for trailer eperiments
+        return
+    
         #If actor is not a vehicle, we cannot use the physics control
         try:
             physics_control = actor.get_physics_control()
@@ -587,9 +380,6 @@ class World(object):
         self.camera_manager.index = None
 
     def destroy(self):
-        if hasattr(self, 'video_writer') and self.video_writer is not None:
-            self.video_writer.release()
-            print(f"Video saved to: {self.video_path}")
         if self.radar_sensor is not None:
             self.toggle_radar()
         sensors = [
@@ -604,8 +394,10 @@ class World(object):
                 sensor.destroy()
         if self.player is not None:
             self.player.destroy()
-        if self.semitrailer is not None:
-            self.semitrailer.destroy()
+        if self.playerTrailer is not None:
+            self.playerTrailer.destroy()
+            
+
 
 # ==============================================================================
 # -- KeyboardControl -----------------------------------------------------------
@@ -616,12 +408,8 @@ class KeyboardControl(object):
     """Class that handles keyboard input."""
     def __init__(self, world, start_in_autopilot):
         self._autopilot_enabled = start_in_autopilot
-        self._ackermann_enabled = False
-        self._ackermann_reverse = 1
-        self.auto_dock = False
         if isinstance(world.player, carla.Vehicle):
             self._control = carla.VehicleControl()
-            self._ackermann_control = carla.VehicleAckermannControl()
             self._lights = carla.VehicleLightState.NONE
             world.player.set_autopilot(self._autopilot_enabled)
             world.player.set_light_state(self._lights)
@@ -664,10 +452,10 @@ class KeyboardControl(object):
                     world.hud.help.toggle()
                 elif event.key == K_TAB:
                     world.camera_manager.toggle_camera()
-                # elif event.key == K_c and pygame.key.get_mods() & KMOD_SHIFT:
-                #     world.next_weather(reverse=True)
-                # elif event.key == K_c:
-                #     world.next_weather()
+                elif event.key == K_c and pygame.key.get_mods() & KMOD_SHIFT:
+                    world.next_weather(reverse=True)
+                elif event.key == K_c:
+                    world.next_weather()
                 elif event.key == K_g:
                     world.toggle_radar()
                 elif event.key == K_BACKQUOTE:
@@ -695,9 +483,6 @@ class KeyboardControl(object):
                             world.player.open_door(carla.VehicleDoor.All)
                     except Exception:
                         pass
-                elif event.key == K_y:
-                    self.auto_dock = not self.auto_dock
-                    world.hud.notification(f"Auto-dock {'ON' if self.auto_dock else 'OFF'}")
                 elif event.key == K_t:
                     if world.show_vehicle_telemetry:
                         world.player.show_debug_telemetry(False)
@@ -753,19 +538,8 @@ class KeyboardControl(object):
                         world.recording_start += 1
                     world.hud.notification("Recording start time is %d" % (world.recording_start))
                 if isinstance(self._control, carla.VehicleControl):
-                    if event.key == K_f:
-                        # Toggle ackermann controller
-                        self._ackermann_enabled = not self._ackermann_enabled
-                        world.hud.show_ackermann_info(self._ackermann_enabled)
-                        world.hud.notification("Ackermann Controller %s" %
-                                               ("Enabled" if self._ackermann_enabled else "Disabled"))
                     if event.key == K_q:
-                        if not self._ackermann_enabled:
-                            self._control.gear = 1 if self._control.reverse else -1
-                        else:
-                            self._ackermann_reverse *= -1
-                            # Reset ackermann control
-                            self._ackermann_control = carla.VehicleAckermannControl()
+                        self._control.gear = 1 if self._control.reverse else -1
                     elif event.key == K_m:
                         self._control.manual_gear_shift = not self._control.manual_gear_shift
                         self._control.gear = world.player.get_control().gear
@@ -827,56 +601,20 @@ class KeyboardControl(object):
                 if current_lights != self._lights: # Change the light state only if necessary
                     self._lights = current_lights
                     world.player.set_light_state(carla.VehicleLightState(self._lights))
-                
-                if self.auto_dock:
-                    if world.distance_m is None:
-                        # self.auto_dock = False
-                        self._control = carla.VehicleControl(brake=1.0)
-                        world.hud.notification("lost trailer – stopping")
-                    elif world.distance_m <= 0:
-                        self.auto_dock = False
-                        self._control = carla.VehicleControl(brake=1.0)
-                        world.hud.notification("Auto-dock: reached - stopping")
-                    else:
-                        throttle_percentage = 0.5 * world.distance_m / 10
-                        creep = carla.VehicleControl(throttle=throttle_percentage, reverse=True)
-                        x, _, w, _ = world.trailer_coordinates
-                        centre_err = ((x + w/2) - world.camera_bp.get_attribute('image_size_x').as_int() / 2)
-                        creep.steer = max(-0.3, min(0.3, 0.002 * centre_err))
-                        self._control = creep
-                # Apply control
-                if not self._ackermann_enabled:
-                    world.player.apply_control(self._control)
-                else:
-                    world.player.apply_ackermann_control(self._ackermann_control)
-                    # Update control to the last one applied by the ackermann controller.
-                    self._control = world.player.get_control()
-                    # Update hud with the newest ackermann control
-                    world.hud.update_ackermann_control(self._ackermann_control)
-
             elif isinstance(self._control, carla.WalkerControl):
                 self._parse_walker_keys(pygame.key.get_pressed(), clock.get_time(), world)
-                world.player.apply_control(self._control)
+            world.player.apply_control(self._control)
 
     def _parse_vehicle_keys(self, keys, milliseconds):
         if keys[K_UP] or keys[K_w]:
-            if not self._ackermann_enabled:
-                self._control.throttle = min(self._control.throttle + 0.1, 1.00)
-            else:
-                self._ackermann_control.speed += round(milliseconds * 0.005, 2) * self._ackermann_reverse
+            self._control.throttle = min(self._control.throttle + 0.01, 1.00)
         else:
-            if not self._ackermann_enabled:
-                self._control.throttle = 0.0
+            self._control.throttle = 0.0
 
         if keys[K_DOWN] or keys[K_s]:
-            if not self._ackermann_enabled:
-                self._control.brake = min(self._control.brake + 0.2, 1)
-            else:
-                self._ackermann_control.speed -= min(abs(self._ackermann_control.speed), round(milliseconds * 0.005, 2)) * self._ackermann_reverse
-                self._ackermann_control.speed = max(0, abs(self._ackermann_control.speed)) * self._ackermann_reverse
+            self._control.brake = min(self._control.brake + 0.2, 1)
         else:
-            if not self._ackermann_enabled:
-                self._control.brake = 0
+            self._control.brake = 0
 
         steer_increment = 5e-4 * milliseconds
         if keys[K_LEFT] or keys[K_a]:
@@ -892,11 +630,8 @@ class KeyboardControl(object):
         else:
             self._steer_cache = 0.0
         self._steer_cache = min(0.7, max(-0.7, self._steer_cache))
-        if not self._ackermann_enabled:
-            self._control.steer = round(self._steer_cache, 1)
-            self._control.hand_brake = keys[K_SPACE]
-        else:
-            self._ackermann_control.steer = round(self._steer_cache, 1)
+        self._control.steer = round(self._steer_cache, 1)
+        self._control.hand_brake = keys[K_SPACE]
 
     def _parse_walker_keys(self, keys, milliseconds, world):
         self._control.speed = 0.0
@@ -942,9 +677,6 @@ class HUD(object):
         self._show_info = True
         self._info_text = []
         self._server_clock = pygame.time.Clock()
-
-        self._show_ackermann_info = False
-        self._ackermann_control = carla.VehicleAckermannControl()
 
     def on_world_tick(self, timestamp):
         self._server_clock.tick()
@@ -994,12 +726,6 @@ class HUD(object):
                 ('Hand brake:', c.hand_brake),
                 ('Manual:', c.manual_gear_shift),
                 'Gear:        %s' % {-1: 'R', 0: 'N'}.get(c.gear, c.gear)]
-            if self._show_ackermann_info:
-                self._info_text += [
-                    '',
-                    'Ackermann Controller:',
-                    '  Target speed: % 8.0f km/h' % (3.6*self._ackermann_control.speed),
-                ]
         elif isinstance(c, carla.WalkerControl):
             self._info_text += [
                 ('Speed:', c.speed, 0.0, 5.556),
@@ -1019,12 +745,6 @@ class HUD(object):
                     break
                 vehicle_type = get_actor_display_name(vehicle, truncate=22)
                 self._info_text.append('% 4dm %s' % (d, vehicle_type))
-
-    def show_ackermann_info(self, enabled):
-        self._show_ackermann_info = enabled
-
-    def update_ackermann_control(self, ackermann_control):
-        self._ackermann_control = ackermann_control
 
     def toggle_info(self):
         self._show_info = not self._show_info
@@ -1356,17 +1076,17 @@ class CameraManager(object):
 
         if not self._parent.type_id.startswith("walker.pedestrian"):
             self._camera_transforms = [
-                (carla.Transform(carla.Location(x=-2.0*bound_x, y=+0.0*bound_y, z=2.0*bound_z), carla.Rotation(pitch=8.0)), Attachment.SpringArmGhost),
+                (carla.Transform(carla.Location(x=-2.0*bound_x, y=+0.0*bound_y, z=2.0*bound_z), carla.Rotation(pitch=8.0)), Attachment.SpringArm),
                 (carla.Transform(carla.Location(x=+0.8*bound_x, y=+0.0*bound_y, z=1.3*bound_z)), Attachment.Rigid),
-                (carla.Transform(carla.Location(x=+1.9*bound_x, y=+1.0*bound_y, z=1.2*bound_z)), Attachment.SpringArmGhost),
-                (carla.Transform(carla.Location(x=-2.8*bound_x, y=+0.0*bound_y, z=4.6*bound_z), carla.Rotation(pitch=6.0)), Attachment.SpringArmGhost),
+                (carla.Transform(carla.Location(x=+1.9*bound_x, y=+1.0*bound_y, z=1.2*bound_z)), Attachment.SpringArm),
+                (carla.Transform(carla.Location(x=-2.8*bound_x, y=+0.0*bound_y, z=4.6*bound_z), carla.Rotation(pitch=6.0)), Attachment.SpringArm),
                 (carla.Transform(carla.Location(x=-1.0, y=-1.0*bound_y, z=0.4*bound_z)), Attachment.Rigid)]
         else:
             self._camera_transforms = [
-                (carla.Transform(carla.Location(x=-2.5, z=0.0), carla.Rotation(pitch=-8.0)), Attachment.SpringArmGhost),
+                (carla.Transform(carla.Location(x=-2.5, z=0.0), carla.Rotation(pitch=-8.0)), Attachment.SpringArm),
                 (carla.Transform(carla.Location(x=1.6, z=1.7)), Attachment.Rigid),
-                (carla.Transform(carla.Location(x=2.5, y=0.5, z=0.0), carla.Rotation(pitch=-8.0)), Attachment.SpringArmGhost),
-                (carla.Transform(carla.Location(x=-4.0, z=2.0), carla.Rotation(pitch=6.0)), Attachment.SpringArmGhost),
+                (carla.Transform(carla.Location(x=2.5, y=0.5, z=0.0), carla.Rotation(pitch=-8.0)), Attachment.SpringArm),
+                (carla.Transform(carla.Location(x=-4.0, z=2.0), carla.Rotation(pitch=6.0)), Attachment.SpringArm),
                 (carla.Transform(carla.Location(x=0, y=-2.5, z=-0.0), carla.Rotation(yaw=90.0)), Attachment.Rigid)]
 
         self.transform_index = 1
@@ -1387,7 +1107,6 @@ class CameraManager(object):
                 'chromatic_aberration_intensity': '0.5',
                 'chromatic_aberration_offset': '0'}],
             ['sensor.camera.optical_flow', cc.Raw, 'Optical Flow', {}],
-            ['sensor.camera.normals', cc.Raw, 'Camera Normals', {}],
         ]
         world = self._parent.get_world()
         bp_library = world.get_blueprint_library()
@@ -1505,7 +1224,7 @@ def game_loop(args):
 
     try:
         client = carla.Client(args.host, args.port)
-        client.set_timeout(2000.0)
+        client.set_timeout(20.0)
 
         sim_world = client.get_world()
         if args.sync:
@@ -1596,6 +1315,11 @@ def main():
         metavar='WIDTHxHEIGHT',
         default='1280x720',
         help='window resolution (default: 1280x720)')
+    argparser.add_argument(
+        '--filter',
+        metavar='PATTERN',
+        default='vehicle.*',
+        help='actor filter (default: "vehicle.*")')
     argparser.add_argument(
         '--generation',
         metavar='G',
